@@ -1,0 +1,28 @@
+# Data files (too large / not ours to distribute)
+data/
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# CatBoost
+catboost_info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude memory
+.claude/
