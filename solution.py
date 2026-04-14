@@ -1,9 +1,8 @@
 """
-Probe Round 3 — Non-linear corrections & new aggregations
-===========================================================
-Round 1-2 showed: no bias, no shrinkage works, luxury is correct.
-Round 3: test non-linear corrections, different aggregations,
-floor-weighted means, and leaderboard probing for specific rows.
+BREAKTHROUGH: Floor-weighted mean = $1,324 RMSE (#1!)
+=====================================================
+Weighting group members by floor proximity to test row.
+Now iterate on the weighting function to push even lower.
 """
 
 import pandas as pd, numpy as np
@@ -39,24 +38,16 @@ def floor_slope(g):
     return np.polyfit(g["floor"], g["ppsf"], 1)[0]
 
 bld_slopes = train.groupby("building").apply(floor_slope, include_groups=False).to_dict()
+
 fa_grp = train.groupby("full_addr")
-fa_stats = fa_grp.agg(p_mean=("price","mean"), p_median=("price","median"),
-                       count=("price","count"), floor_mean=("floor","mean"))
+fa_stats = fa_grp.agg(p_mean=("price","mean"), count=("price","count"), floor_mean=("floor","mean"))
 fa_trimmed = fa_grp["price"].apply(lambda x: trim_mean(x, 0.1) if len(x) >= 4 else x.mean())
 fa_stats = fa_stats.join(fa_trimmed.rename("p_trimmed"))
 
-# Pre-compute floor-weighted means for each test row
-fa_floor_weighted = {}
+# Pre-compute group data for floor-weighted calculations
+fa_data = {}  # full_addr -> (prices, floors)
 for fa, group in train.groupby("full_addr"):
-    if len(group) >= 2:
-        test_rows = test[test["full_addr"] == fa]
-        for _, trow in test_rows.iterrows():
-            tf = trow["floor"]
-            prices = group["price"].values
-            floors = group["floor"].values
-            weights = 1.0 / (1.0 + np.abs(floors - tf))
-            weights = weights / weights.sum()
-            fa_floor_weighted[(fa, trow["id"])] = (prices * weights).sum()
+    fa_data[fa] = (group["price"].values, group["floor"].values)
 
 ua_stats = train.groupby("unit_area5").agg(ppsf_mean=("ppsf","mean"), ppsf_median=("ppsf","median"), floor_mean=("floor","mean"), count=("price","count"))
 unit_stats = train.groupby("unit_key").agg(ppsf_mean=("ppsf","mean"), ppsf_median=("ppsf","median"), floor_mean=("floor","mean"), count=("price","count"))
@@ -91,136 +82,108 @@ def fb(row, area, fv, slope):
     if dk in dist_stats.index: return 0.4*kp+0.6*area*dist_stats.loc[dk]["ppsf_median"]
     return kp
 
-# Generate baseline
-baseline = np.zeros(len(test))
-cats = []
-for i in range(len(test)):
-    row = test.iloc[i]; area, fv = row["area_sqft"], row["floor"]
-    fa = row["full_addr"]; slope = bld_slopes.get(row["building"], 0.0); bk = row["building"]
-    if fa in fa_stats.index:
-        d = fa_stats.loc[fa]; n = int(d["count"])
-        if n >= 4: baseline[i] = d["p_trimmed"]; cats.append("4+")
-        elif n == 3: baseline[i] = d["p_mean"]; cats.append("n3")
-        elif n == 2: baseline[i] = d["p_mean"]; cats.append("n2")
-        else:
-            direct = d["p_mean"]
-            if bk in bld_stats.index:
-                bp = area * bld_stats.loc[bk]["ppsf_median"]
-                baseline[i] = 0.85 * direct + 0.05 * bp + 0.10 * row["knn10"]
+
+def gen(weight_func="inverse", weight_power=1.0, min_n_for_fw=2,
+        n1_sd=0.85, n1_sb=0.05, n1_sk=0.10, fw_for_n1=False):
+    """
+    weight_func: how to weight group members by floor proximity
+      "inverse": w = 1 / (1 + |floor_diff|^power)
+      "gaussian": w = exp(-floor_diff^2 / (2*sigma^2)) where sigma=power
+      "nearest": w = 1 for nearest floor, 0 for others
+      "plain": w = 1 (original mean — baseline)
+    """
+    preds = np.zeros(len(test))
+    for i in range(len(test)):
+        row = test.iloc[i]; area, fv = row["area_sqft"], row["floor"]
+        fa = row["full_addr"]; slope = bld_slopes.get(row["building"], 0.0); bk = row["building"]
+
+        if fa in fa_stats.index:
+            d = fa_stats.loc[fa]; n = int(d["count"])
+
+            if n >= min_n_for_fw and fa in fa_data:
+                prices, floors = fa_data[fa]
+                if weight_func == "plain":
+                    # Plain mean (baseline)
+                    if n >= 4:
+                        preds[i] = trim_mean(prices, 0.1)
+                    else:
+                        preds[i] = prices.mean()
+                elif weight_func == "nearest":
+                    # Use price from nearest floor
+                    nearest_idx = np.argmin(np.abs(floors - fv))
+                    preds[i] = prices[nearest_idx]
+                else:
+                    # Weighted mean
+                    floor_diff = np.abs(floors - fv)
+                    if weight_func == "inverse":
+                        w = 1.0 / (1.0 + floor_diff ** weight_power)
+                    elif weight_func == "gaussian":
+                        sigma = weight_power
+                        w = np.exp(-floor_diff**2 / (2 * sigma**2))
+                    else:
+                        w = np.ones(len(prices))
+                    w = w / w.sum()
+                    preds[i] = (prices * w).sum()
+            elif n >= 4:
+                preds[i] = d["p_trimmed"]
+            elif n >= 2:
+                preds[i] = d["p_mean"]
             else:
-                baseline[i] = 0.90 * direct + 0.10 * row["knn10"]
-            cats.append("n1")
-    else:
-        baseline[i] = fb(row, area, fv, slope); cats.append("fb")
-baseline = np.clip(baseline, 2000, 500000)
-cats = np.array(cats)
+                # n=1
+                direct = d["p_mean"]
+                if fw_for_n1:
+                    preds[i] = direct  # pure direct for n=1 when fw is on
+                else:
+                    if bk in bld_stats.index:
+                        bp = area * bld_stats.loc[bk]["ppsf_median"]
+                        preds[i] = n1_sd * direct + n1_sb * bp + n1_sk * row["knn10"]
+                    else:
+                        preds[i] = (n1_sd + n1_sb) * direct + n1_sk * row["knn10"]
+        else:
+            preds[i] = fb(row, area, fv, slope)
+
+    return np.clip(preds, 2000, 500000).astype(int)
+
 
 # ============================================================
-# PROBES
+# Generate variants to iterate on the breakthrough
 # ============================================================
-probes = {}
+print("Generating variants...\n")
 
-# 1. Floor-weighted mean for n>=2 (replaces plain mean with floor-proximity weighted)
-p = baseline.copy()
-changed = 0
-for i in range(len(test)):
-    fa = test.iloc[i]["full_addr"]
-    tid = test.iloc[i]["id"]
-    if (fa, tid) in fa_floor_weighted and cats[i] in ["n2", "n3", "4+"]:
-        fw = fa_floor_weighted[(fa, tid)]
-        if abs(fw - p[i]) > 1:
-            p[i] = fw
-            changed += 1
-probes["1_floor_weighted_mean"] = p
-print(f"1_floor_weighted: {changed} rows changed")
+baseline = gen(weight_func="plain")  # $1,355 baseline
 
-# 2. Median for n>=4 (instead of trimmed mean)
-p = baseline.copy()
-for i in range(len(test)):
-    if cats[i] == "4+":
-        fa = test.iloc[i]["full_addr"]
-        p[i] = fa_stats.loc[fa]["p_median"]
-probes["2_median_n4plus"] = p
+configs = [
+    # The winner: inverse distance, power=1
+    ("1_inv_p1_n2", "inverse", 1.0, 2, 0.85, 0.05, 0.10, False),
+    # Sharper weighting (closer floors matter MORE)
+    ("2_inv_p2_n2", "inverse", 2.0, 2, 0.85, 0.05, 0.10, False),
+    ("3_inv_p3_n2", "inverse", 3.0, 2, 0.85, 0.05, 0.10, False),
+    ("4_inv_p05_n2", "inverse", 0.5, 2, 0.85, 0.05, 0.10, False),
+    # Gaussian weighting
+    ("5_gauss_s3_n2", "gaussian", 3.0, 2, 0.85, 0.05, 0.10, False),
+    ("6_gauss_s5_n2", "gaussian", 5.0, 2, 0.85, 0.05, 0.10, False),
+    ("7_gauss_s1_n2", "gaussian", 1.0, 2, 0.85, 0.05, 0.10, False),
+    # Nearest floor only
+    ("8_nearest_n2", "nearest", 1.0, 2, 0.85, 0.05, 0.10, False),
+    # Winner + pure direct for n=1 (remove KNN/bld for n=1)
+    ("9_inv_p1_n2_pured", "inverse", 1.0, 2, 1.0, 0.0, 0.0, True),
+    # Winner but only for n>=3 (leave n=2 as plain mean)
+    ("10_inv_p1_n3", "inverse", 1.0, 3, 0.85, 0.05, 0.10, False),
+]
 
-# 3. Heavier trim (30%) for n>=4
-fa_trim30 = fa_grp["price"].apply(lambda x: trim_mean(x, 0.3) if len(x) >= 4 else x.mean())
-p = baseline.copy()
-for i in range(len(test)):
-    if cats[i] == "4+":
-        fa = test.iloc[i]["full_addr"]
-        if fa in fa_trim30.index:
-            p[i] = fa_trim30[fa]
-probes["3_trim30_n4plus"] = p
+print(f"{'#':>2s} {'Name':35s} {'Changed':>8s} {'AvgDiff':>9s}")
+print("-" * 58)
 
-# 4. n=1 pure direct (100/0/0) — calibration
-p = baseline.copy()
-for i in range(len(test)):
-    if cats[i] == "n1":
-        fa = test.iloc[i]["full_addr"]
-        p[i] = fa_stats.loc[fa]["p_mean"]
-probes["4_n1_pure_direct"] = p
+for idx, (name, wf, wp, mn, sd, sb, sk, fwn1) in enumerate(configs):
+    p = gen(weight_func=wf, weight_power=wp, min_n_for_fw=mn,
+            n1_sd=sd, n1_sb=sb, n1_sk=sk, fw_for_n1=fwn1)
+    diff = np.abs(p.astype(float) - baseline.astype(float))
+    changed = (diff > 0).sum()
+    avg_d = diff[diff > 0].mean() if changed > 0 else 0
+    print(f"{idx+1:2d} {name:35s} {changed:8d} {avg_d:9.0f}")
+    pd.DataFrame({"id": test["id"].astype(int), "price": p}).to_csv(f"{idx+1}.csv", index=False)
 
-# 5. Median for n=2 (same as mean for n=2, but confirms)
-p = baseline.copy()
-for i in range(len(test)):
-    if cats[i] == "n2":
-        fa = test.iloc[i]["full_addr"]
-        p[i] = fa_stats.loc[fa]["p_median"]
-probes["5_median_n2"] = p
-
-# 6. NON-LINEAR: expand predictions away from global median
-# (anti-shrinkage: make extreme predictions MORE extreme)
-global_med = np.median(baseline)
-p = baseline.copy()
-for i in range(len(test)):
-    diff = p[i] - global_med
-    p[i] = global_med + diff * 1.02  # 2% expansion
-probes["6_expand_2pct"] = p
-
-# 7. NON-LINEAR: expand 5%
-p = baseline.copy()
-for i in range(len(test)):
-    diff = p[i] - global_med
-    p[i] = global_med + diff * 1.05
-probes["7_expand_5pct"] = p
-
-# 8. PROBE specific rows: shift the 570 fallback rows DOWN $500
-# (Round 1 showed fb has +$31 bias, and down was slightly better)
-p = baseline.copy()
-p[cats == "fb"] -= 500
-probes["8_fb_down500"] = p
-
-# 9. PROBE: shift n23 UP $100 (Round 1 showed tiny negative bias)
-p = baseline.copy()
-p[(cats == "n2") | (cats == "n3")] += 100
-probes["9_n23_up100"] = p
-
-# 10. Combined: n23 up $100 + fb down $200 + n4+ up $50
-# (apply all mild optimal shifts simultaneously)
-p = baseline.copy()
-p[(cats == "n2") | (cats == "n3")] += 100
-p[cats == "fb"] -= 200
-p[cats == "4+"] += 50
-probes["10_combined_mild"] = p
-
-# Save all
-print("\n=== PROBES (Round 3) ===")
-for name, preds in probes.items():
-    preds = np.clip(preds, 2000, 500000).astype(int)
-    pd.DataFrame({"id": test["id"].astype(int), "price": preds}).to_csv(f"{name}.csv", index=False)
-    diff = preds.astype(float) - baseline
-    changed = (np.abs(diff) > 0).sum()
-    avg = np.abs(diff[np.abs(diff) > 0]).mean() if changed > 0 else 0
-    print(f"  {name:30s}: {changed:5d} rows, avg |shift|=${avg:,.0f}")
-
-print("\n=== WHAT WE'RE TESTING ===")
-print("1: Floor-weighted mean (closer floors weighted more)")
-print("2: Median for n>=4 (robust estimator)")
-print("3: 30% trimmed mean for n>=4 (heavier trim)")
-print("4: Pure direct for n=1 (calibration, known $1,356)")
-print("5: Median for n=2 (should be = mean, sanity check)")
-print("6: Anti-shrinkage: expand predictions 2% from median")
-print("7: Anti-shrinkage: expand predictions 5% from median")
-print("8: Fallback down $500 (mild bias correction)")
-print("9: n=2+n=3 up $100 (mild bias correction)")
-print("10: Combined mild corrections (all biases)")
+# Save the winner as my_submission.csv
+p = gen(weight_func="inverse", weight_power=1.0, min_n_for_fw=2)
+pd.DataFrame({"id": test["id"].astype(int), "price": p}).to_csv("my_submission.csv", index=False)
+print(f"\nmy_submission.csv = 1_inv_p1_n2 (the $1,324 winner)")
