@@ -2,14 +2,14 @@
 
 Predicting monthly rental prices for 8,633 Hong Kong apartments. **#1 on leaderboard** with **$1,293 RMSE** using pure hardcoded lookup with two key innovations — zero ML.
 
-## Leaderboard
+## Results
 
-| Rank | Team | RMSE | MAE | R² |
-|------|------|------|-----|-----|
-| **1** | **Murathan** | **$1,293** | $482 | 0.9944 |
-| 2 | JigsawBlock | $1,327 | $553 | 0.9941 |
-| 3 | EvilPig | $1,352 | $595 | 0.9939 |
-| 4 | SuperPig233 | $1,353 | $592 | 0.9938 |
+| Rank | RMSE | MAE | R² |
+|------|------|-----|-----|
+| **#1** | **$1,293** | $482 | 0.9944 |
+| #2 | $1,327 | $553 | 0.9941 |
+| #3 | $1,352 | $595 | 0.9939 |
+| #4 | $1,353 | $592 | 0.9938 |
 
 ## The Two Breakthroughs
 
